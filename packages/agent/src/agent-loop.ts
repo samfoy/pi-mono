@@ -48,7 +48,11 @@ export function agentLoop(
 			stream.push({ type: "message_end", message: prompt });
 		}
 
-		await runLoop(currentContext, newMessages, config, signal, stream, streamFn);
+		try {
+			await runLoop(currentContext, newMessages, config, signal, stream, streamFn);
+		} catch (err) {
+			handleLoopError(err, config, newMessages, stream);
+		}
 	})();
 
 	return stream;
@@ -85,7 +89,11 @@ export function agentLoopContinue(
 		stream.push({ type: "agent_start" });
 		stream.push({ type: "turn_start" });
 
-		await runLoop(currentContext, newMessages, config, signal, stream, streamFn);
+		try {
+			await runLoop(currentContext, newMessages, config, signal, stream, streamFn);
+		} catch (err) {
+			handleLoopError(err, config, newMessages, stream);
+		}
 	})();
 
 	return stream;
@@ -96,6 +104,42 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 		(event: AgentEvent) => event.type === "agent_end",
 		(event: AgentEvent) => (event.type === "agent_end" ? event.messages : []),
 	);
+}
+
+/**
+ * Handle errors from the agent loop producer.
+ * Emits an agent_end event with an error message so the consumer (for-await)
+ * receives it gracefully instead of crashing with an unhandled promise rejection.
+ */
+function handleLoopError(
+	err: unknown,
+	config: AgentLoopConfig,
+	newMessages: AgentMessage[],
+	stream: EventStream<AgentEvent, AgentMessage[]>,
+): void {
+	const isAbort = err instanceof DOMException && err.name === "AbortError";
+	const errorMsg: AgentMessage = {
+		role: "assistant",
+		content: [{ type: "text", text: "" }],
+		api: config.model.api,
+		provider: config.model.provider,
+		model: config.model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: isAbort ? "aborted" : "error",
+		errorMessage: isAbort ? "Request was aborted" : (err instanceof Error ? err.message : String(err)),
+		timestamp: Date.now(),
+	} as AgentMessage;
+	newMessages.push(errorMsg);
+	stream.push({ type: "turn_end", message: errorMsg, toolResults: [] });
+	stream.push({ type: "agent_end", messages: newMessages });
+	stream.end(newMessages);
 }
 
 /**

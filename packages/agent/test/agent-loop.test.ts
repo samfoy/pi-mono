@@ -533,3 +533,240 @@ describe("agentLoopContinue with AgentMessage", () => {
 		expect(messages[0].role).toBe("assistant");
 	});
 });
+
+describe("agentLoop abort handling", () => {
+	it("should gracefully handle AbortError from signal during streaming", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [],
+		};
+
+		const userPrompt: AgentMessage = createUserMessage("Hello");
+		const abortController = new AbortController();
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			// Don't resolve — simulate a hanging stream that will be aborted
+			// The abort signal will cause the for-await consumer to throw
+			setTimeout(() => {
+				if (abortController.signal.aborted) {
+					// Simulate what happens when fetch is aborted: the stream errors
+					stream.push({
+						type: "error",
+						reason: "aborted",
+						error: createAssistantMessage("Aborted"),
+					});
+				}
+			}, 50);
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([userPrompt], context, config, abortController.signal, streamFn);
+
+		// Abort after a short delay
+		setTimeout(() => abortController.abort(), 20);
+
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const eventTypes = events.map((e) => e.type);
+		expect(eventTypes).toContain("agent_start");
+		expect(eventTypes).toContain("agent_end");
+
+		// Should not crash the process with an unhandled rejection
+		const messages = await stream.result();
+		expect(messages.length).toBeGreaterThanOrEqual(1);
+	});
+
+	it("should handle streamFn throwing an error without crashing", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [],
+		};
+
+		const userPrompt: AgentMessage = createUserMessage("Hello");
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+
+		const streamFn = () => {
+			throw new Error("Connection failed");
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([userPrompt], context, config, undefined, streamFn);
+
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const eventTypes = events.map((e) => e.type);
+		expect(eventTypes).toContain("agent_start");
+		expect(eventTypes).toContain("agent_end");
+
+		// Should have an error message in the result
+		const messages = await stream.result();
+		const errorMessage = messages.find((m) => (m as any).stopReason === "error");
+		expect(errorMessage).toBeDefined();
+		expect((errorMessage as any).errorMessage).toBe("Connection failed");
+	});
+
+	it("should handle convertToLlm throwing an error without crashing", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [],
+		};
+
+		const userPrompt: AgentMessage = createUserMessage("Hello");
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: () => {
+				throw new Error("Conversion failed");
+			},
+		};
+
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage([{ type: "text", text: "Hi" }]);
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([userPrompt], context, config, undefined, streamFn);
+
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const eventTypes = events.map((e) => e.type);
+		expect(eventTypes).toContain("agent_end");
+
+		const messages = await stream.result();
+		const errorMessage = messages.find((m) => (m as any).stopReason === "error");
+		expect(errorMessage).toBeDefined();
+		expect((errorMessage as any).errorMessage).toBe("Conversion failed");
+	});
+
+	it("should set stopReason to 'aborted' for AbortError", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [],
+		};
+
+		const userPrompt: AgentMessage = createUserMessage("Hello");
+		const abortController = new AbortController();
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+
+		const streamFn = () => {
+			// Throw an AbortError synchronously to simulate what happens
+			// when the signal is already aborted
+			throw new DOMException("This operation was aborted", "AbortError");
+		};
+
+		// Abort before starting
+		abortController.abort();
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([userPrompt], context, config, abortController.signal, streamFn);
+
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const messages = await stream.result();
+		const errorMessage = messages.find((m) => (m as any).stopReason === "aborted");
+		expect(errorMessage).toBeDefined();
+		expect((errorMessage as any).errorMessage).toBe("Request was aborted");
+	});
+});
+
+describe("agentLoopContinue abort handling", () => {
+	it("should handle errors in the producer without crashing", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [createUserMessage("Hello")],
+			tools: [],
+		};
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: () => {
+				throw new Error("Conversion failed in continue");
+			},
+		};
+
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage([{ type: "text", text: "Hi" }]);
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoopContinue(context, config, undefined, streamFn);
+
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const eventTypes = events.map((e) => e.type);
+		expect(eventTypes).toContain("agent_end");
+
+		const messages = await stream.result();
+		const errorMessage = messages.find((m) => (m as any).stopReason === "error");
+		expect(errorMessage).toBeDefined();
+		expect((errorMessage as any).errorMessage).toBe("Conversion failed in continue");
+	});
+
+	it("should set stopReason to 'aborted' for AbortError in continue", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [createUserMessage("Hello")],
+			tools: [],
+		};
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+
+		const streamFn = () => {
+			throw new DOMException("This operation was aborted", "AbortError");
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoopContinue(context, config, undefined, streamFn);
+
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const messages = await stream.result();
+		const errorMessage = messages.find((m) => (m as any).stopReason === "aborted");
+		expect(errorMessage).toBeDefined();
+		expect((errorMessage as any).errorMessage).toBe("Request was aborted");
+	});
+});
